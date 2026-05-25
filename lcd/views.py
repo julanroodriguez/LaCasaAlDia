@@ -56,6 +56,10 @@ def require_profile(request):
     profile = profile_or_none(request.user)
     if not profile:
         return None, error("Debes iniciar sesion.", 401)
+    if profile.status == Profile.STATUS_PENDING:
+        return None, error("Tu cuenta esta pendiente de aprobacion por administracion.", 403)
+    if profile.status == Profile.STATUS_REJECTED:
+        return None, error("Tu registro fue rechazado por administracion.", 403)
     if profile.status == Profile.STATUS_BLOCKED:
         return None, error("Tu cuenta esta bloqueada.", 403)
     return profile, None
@@ -119,6 +123,11 @@ def serialize_service(service):
 
 
 def serialize_reservation(reservation):
+    payments = list(reservation.payments.all())
+    ratings = list(reservation.ratings.select_related("from_profile__user", "to_profile__user"))
+    is_paid = any(p.status == Payment.STATUS_PAID for p in payments)
+    client_rated = any(rating.from_profile_id == reservation.client_id for rating in ratings)
+    provider_rated = any(rating.from_profile_id == reservation.provider_id for rating in ratings)
     return {
         "id": reservation.id,
         "client": serialize_profile(reservation.client),
@@ -130,11 +139,56 @@ def serialize_reservation(reservation):
         "notes": reservation.notes,
         "status": reservation.status,
         "total": money(reservation.total),
+        "is_paid": is_paid,
+        "client_rated": client_rated,
+        "provider_rated": provider_rated,
+        "workflow_status": service_workflow_status(reservation, is_paid, client_rated, provider_rated),
+        "payments": [
+            {
+                "id": p.id,
+                "amount": money(p.amount),
+                "status": p.status,
+                "created_at": p.created_at.isoformat(),
+            }
+            for p in payments
+        ],
+        "ratings": [
+            {
+                "id": rating.id,
+                "from_profile_id": rating.from_profile_id,
+                "from_name": rating.from_profile.user.get_full_name() or rating.from_profile.user.username,
+                "to_profile_id": rating.to_profile_id,
+                "to_name": rating.to_profile.user.get_full_name() or rating.to_profile.user.username,
+                "stars": rating.stars,
+                "comment": rating.comment,
+                "created_at": rating.created_at.isoformat(),
+            }
+            for rating in ratings
+        ],
         "created_at": reservation.created_at.isoformat(),
     }
 
 
+def service_workflow_status(reservation, is_paid, client_rated, provider_rated):
+    if reservation.status == Reservation.STATUS_PENDING:
+        return "Pendiente de aceptacion"
+    if reservation.status == Reservation.STATUS_ACCEPTED:
+        return "Aceptada"
+    if reservation.status == Reservation.STATUS_IN_PROGRESS:
+        return "Prestando servicio"
+    if reservation.status in [Reservation.STATUS_CANCELLED, Reservation.STATUS_REJECTED]:
+        return "Cancelada o rechazada"
+    if reservation.status == Reservation.STATUS_FINISHED and not is_paid:
+        return "Finalizado, pago pendiente"
+    if reservation.status == Reservation.STATUS_FINISHED and is_paid and not (client_rated and provider_rated):
+        return "Pago realizado, calificaciones pendientes"
+    if reservation.status == Reservation.STATUS_FINISHED and is_paid:
+        return "Terminado"
+    return reservation.status
+
+
 def serialize_offer(offer, with_apps=False):
+    application_count = offer.applications.count() if offer.pk else 0
     data = {
         "id": offer.id,
         "client": serialize_profile(offer.client),
@@ -146,6 +200,9 @@ def serialize_offer(offer, with_apps=False):
         "scheduled_for": offer.scheduled_for.isoformat() if offer.scheduled_for else "",
         "status": offer.status,
         "selected_application_id": offer.selected_application_id,
+        "application_count": application_count,
+        "can_edit": application_count == 0 and offer.status == Offer.STATUS_OPEN,
+        "can_delete": offer.status == Offer.STATUS_OPEN,
         "created_at": offer.created_at.isoformat(),
     }
     if with_apps:
@@ -162,6 +219,38 @@ def serialize_offer(offer, with_apps=False):
     return data
 
 
+def visible_offers_for(profile):
+    qs = Offer.objects.select_related("client__user").prefetch_related("applications__provider__user")
+    if profile.role == Profile.ROLE_CLIENT:
+        return qs.filter(client=profile, status=Offer.STATUS_OPEN)
+    if profile.role in [Profile.ROLE_OV, Profile.ROLE_LAV]:
+        kind = Offer.TYPE_OV if profile.role == Profile.ROLE_OV else Offer.TYPE_LAUNDRY
+        return qs.filter(service_type=kind, status=Offer.STATUS_OPEN)
+    return qs
+
+
+def visible_payments_for(profile):
+    qs = Payment.objects.select_related("reservation__provider__user", "reservation__client__user")
+    if profile.role == Profile.ROLE_CLIENT:
+        return qs.filter(client=profile)
+    if profile.role in [Profile.ROLE_OV, Profile.ROLE_LAV]:
+        return qs.filter(reservation__provider=profile)
+    return qs
+
+
+def serialize_payment(payment):
+    return {
+        "id": payment.id,
+        "amount": money(payment.amount),
+        "status": payment.status,
+        "transaction_code": payment.transaction_code,
+        "created_at": payment.created_at.isoformat(),
+        "reservation_id": payment.reservation_id,
+        "client_id": payment.client_id,
+        "provider_id": payment.reservation.provider_id if payment.reservation_id else None,
+    }
+
+
 def notify(profile, title, body=""):
     Notification.objects.create(recipient=profile, title=title, body=body)
 
@@ -169,6 +258,9 @@ def notify(profile, title, body=""):
 @csrf_exempt
 def session_view(request):
     profile = profile_or_none(request.user)
+    if profile and profile.status != Profile.STATUS_APPROVED:
+        logout(request)
+        return ok({"authenticated": False, "profile": None})
     return ok({"authenticated": bool(profile), "profile": serialize_profile(profile) if profile else None})
 
 
@@ -204,7 +296,7 @@ def register(request):
         bio=data.get("bio", ""),
         store_address=data.get("store_address", ""),
         provides_home_service=bool(data.get("provides_home_service", True)),
-        status=Profile.STATUS_APPROVED if role == Profile.ROLE_CLIENT else Profile.STATUS_PENDING,
+        status=Profile.STATUS_PENDING,
     )
     if role == Profile.ROLE_ADMIN:
         profile.status = Profile.STATUS_APPROVED
@@ -212,9 +304,20 @@ def register(request):
         user.is_staff = True
         user.is_superuser = True
         user.save(update_fields=["is_staff", "is_superuser"])
-    login(request, user)
-    notify(profile, "Registro creado", "Tu cuenta quedo guardada en La Casa al Dia.")
-    return ok({"profile": serialize_profile(profile)}, 201)
+        login(request, user)
+        notify(profile, "Registro creado", "Tu cuenta quedo guardada en La Casa al Dia.")
+        return ok({"profile": serialize_profile(profile)}, 201)
+    for admin_profile in Profile.objects.filter(role=Profile.ROLE_ADMIN):
+        notify(admin_profile, "Nuevo registro pendiente", f"{profile.user.get_full_name() or profile.user.email} espera aprobacion.")
+    notify(profile, "Registro pendiente", "Tu cuenta quedo en revision. Podras iniciar sesion cuando administracion la apruebe.")
+    return ok(
+        {
+            "profile": serialize_profile(profile),
+            "message": "Tu registro quedo pendiente de aprobacion por administracion.",
+            "pending_approval": True,
+        },
+        201,
+    )
 
 
 @csrf_exempt
@@ -227,6 +330,10 @@ def login_view(request):
     profile = profile_or_none(user)
     if not profile:
         return error("El usuario no tiene perfil asociado.", 403)
+    if profile.status == Profile.STATUS_PENDING:
+        return error("Tu cuenta esta pendiente de aprobacion por administracion.", 403)
+    if profile.status == Profile.STATUS_REJECTED:
+        return error("Tu registro fue rechazado por administracion.", 403)
     if profile.status == Profile.STATUS_BLOCKED:
         return error("La cuenta esta bloqueada.", 403)
     login(request, user)
@@ -244,15 +351,12 @@ def bootstrap(request):
     profile, denied = require_profile(request)
     if denied:
         return denied
-    reservations_q = Reservation.objects.select_related("client__user", "provider__user", "service")
+    reservations_q = Reservation.objects.select_related("client__user", "provider__user", "service").prefetch_related(
+        "payments", "ratings__from_profile__user", "ratings__to_profile__user"
+    )
     if not is_admin(profile):
         reservations_q = reservations_q.filter(Q(client=profile) | Q(provider=profile))
-    offers_q = Offer.objects.select_related("client__user").prefetch_related("applications__provider__user")
-    if profile.role == Profile.ROLE_CLIENT:
-        offers_q = offers_q.filter(client=profile)
-    elif profile.role in [Profile.ROLE_OV, Profile.ROLE_LAV]:
-        service_type = Offer.TYPE_OV if profile.role == Profile.ROLE_OV else Offer.TYPE_LAUNDRY
-        offers_q = offers_q.filter(Q(service_type=service_type, status=Offer.STATUS_OPEN) | Q(applications__provider=profile)).distinct()
+    offers_q = visible_offers_for(profile)
     return ok(
         {
             "profile": serialize_profile(profile),
@@ -260,17 +364,7 @@ def bootstrap(request):
             "services": [serialize_service(s) for s in ProviderService.objects.select_related("provider__user").filter(active=True)],
             "reservations": [serialize_reservation(r) for r in reservations_q.order_by("-scheduled_for")[:100]],
             "offers": [serialize_offer(o, True) for o in offers_q.order_by("-created_at")[:100]],
-            "payments": [
-                {
-                    "id": p.id,
-                    "amount": money(p.amount),
-                    "status": p.status,
-                    "transaction_code": p.transaction_code,
-                    "created_at": p.created_at.isoformat(),
-                    "reservation_id": p.reservation_id,
-                }
-                for p in Payment.objects.filter(client=profile).order_by("-created_at")[:50]
-            ],
+            "payments": [serialize_payment(p) for p in visible_payments_for(profile).order_by("-created_at")[:50]],
             "notifications": [
                 {"id": n.id, "title": n.title, "body": n.body, "read": n.read, "created_at": n.created_at.isoformat()}
                 for n in profile.notifications.order_by("-created_at")[:50]
@@ -329,7 +423,9 @@ def reservations(request):
     if denied:
         return denied
     if request.method == "GET":
-        qs = Reservation.objects.select_related("client__user", "provider__user", "service")
+        qs = Reservation.objects.select_related("client__user", "provider__user", "service").prefetch_related(
+            "payments", "ratings__from_profile__user", "ratings__to_profile__user"
+        )
         if not is_admin(profile):
             qs = qs.filter(Q(client=profile) | Q(provider=profile))
         return ok({"reservations": [serialize_reservation(r) for r in qs.order_by("-scheduled_for")]})
@@ -373,6 +469,13 @@ def reservation_status(request, reservation_id):
         return error("No tienes permiso para cambiar esta reserva.", 403)
     if profile == reservation.client and new_status not in [Reservation.STATUS_CANCELLED]:
         return error("El cliente solo puede cancelar desde este endpoint.", 403)
+    if profile == reservation.provider and new_status not in [
+        Reservation.STATUS_ACCEPTED,
+        Reservation.STATUS_IN_PROGRESS,
+        Reservation.STATUS_REJECTED,
+        Reservation.STATUS_FINISHED,
+    ]:
+        return error("El prestador no puede cambiar a ese estado.", 403)
     reservation.status = new_status
     reservation.save(update_fields=["status", "updated_at"])
     notify(reservation.client, "Reserva actualizada", f"Tu reserva ahora esta en estado {new_status}.")
@@ -386,12 +489,7 @@ def offers(request):
     if denied:
         return denied
     if request.method == "GET":
-        qs = Offer.objects.select_related("client__user").prefetch_related("applications__provider__user")
-        if profile.role == Profile.ROLE_CLIENT:
-            qs = qs.filter(client=profile)
-        elif profile.role in [Profile.ROLE_OV, Profile.ROLE_LAV]:
-            kind = Offer.TYPE_OV if profile.role == Profile.ROLE_OV else Offer.TYPE_LAUNDRY
-            qs = qs.filter(service_type=kind, status=Offer.STATUS_OPEN)
+        qs = visible_offers_for(profile)
         return ok({"offers": [serialize_offer(o, True) for o in qs.order_by("-created_at")]})
     data = payload(request)
     if profile.role != Profile.ROLE_CLIENT:
@@ -406,6 +504,49 @@ def offers(request):
         scheduled_for=dt(data.get("scheduled_for")),
     )
     return ok({"offer": serialize_offer(offer, True)}, 201)
+
+
+@csrf_exempt
+def offer_detail(request, offer_id):
+    profile, denied = require_profile(request)
+    if denied:
+        return denied
+    offer = get_object_or_404(
+        Offer.objects.select_related("client__user").prefetch_related("applications__provider__user"),
+        pk=offer_id,
+    )
+    if offer.client != profile:
+        return error("Solo el cliente que publico la oferta puede modificarla.", 403)
+    if offer.status != Offer.STATUS_OPEN:
+        return error("Solo las ofertas abiertas se pueden modificar.", 409)
+
+    if request.method == "DELETE":
+        offer.status = Offer.STATUS_REMOVED
+        offer.save(update_fields=["status"])
+        notify(profile, "Oferta eliminada", f"La oferta {offer.title} fue retirada.")
+        return ok({"offer": serialize_offer(offer, True)})
+
+    if request.method not in ["PUT", "PATCH", "POST"]:
+        return error("Metodo no permitido.", 405)
+    if offer.applications.exists():
+        return error("La oferta ya tiene postulaciones y no se puede editar.", 409)
+
+    data = payload(request)
+    editable = ["title", "description", "address"]
+    for field in editable:
+        if field in data:
+            setattr(offer, field, data.get(field) or "")
+    if "service_type" in data:
+        if data["service_type"] not in dict(Offer.TYPE_CHOICES):
+            return error("Tipo de servicio invalido.")
+        offer.service_type = data["service_type"]
+    if "budget" in data:
+        offer.budget = Decimal(str(data.get("budget") or 0))
+    if "scheduled_for" in data:
+        offer.scheduled_for = dt(data.get("scheduled_for"))
+    offer.save(update_fields=["title", "service_type", "description", "address", "budget", "scheduled_for"])
+    notify(profile, "Oferta actualizada", f"Guardamos los cambios de {offer.title}.")
+    return ok({"offer": serialize_offer(offer, True)})
 
 
 @csrf_exempt
@@ -431,12 +572,38 @@ def choose_application(request, offer_id, application_id):
     if denied:
         return denied
     offer = get_object_or_404(Offer, pk=offer_id, client=profile)
+    if offer.status != Offer.STATUS_OPEN:
+        return error("Esta oferta ya no esta abierta.", 409)
     app = get_object_or_404(OfferApplication, pk=application_id, offer=offer)
+    proposed_price = app.proposed_price or offer.budget
+    category = ProviderService.CATEGORY_OV if offer.service_type == Offer.TYPE_OV else ProviderService.CATEGORY_LAUNDRY
+    service = ProviderService.objects.create(
+        provider=app.provider,
+        category=category,
+        name=f"Oferta: {offer.title}"[:80],
+        description=offer.description,
+        price=proposed_price,
+        active=False,
+    )
+    reservation = Reservation.objects.create(
+        client=profile,
+        provider=app.provider,
+        service=service,
+        scheduled_for=offer.scheduled_for or timezone.now(),
+        modality=Reservation.MODALITY_HOME,
+        address=offer.address or profile.address,
+        notes=f"Servicio creado desde la oferta #{offer.id}. {app.message}".strip(),
+        status=Reservation.STATUS_ACCEPTED,
+        total=proposed_price,
+    )
+    conv = Conversation.objects.create(reservation=reservation, offer=offer)
+    conv.participants.set([profile, app.provider])
     offer.selected_application = app
     offer.status = Offer.STATUS_ASSIGNED
     offer.save(update_fields=["selected_application", "status"])
     notify(app.provider, "Postulacion aceptada", f"Fuiste elegido para la oferta {offer.title}.")
-    return ok({"offer": serialize_offer(offer, True)})
+    notify(profile, "Servicio aceptado", f"Se creo la reserva #{reservation.id} para {app.provider.user.get_full_name() or app.provider.user.email}.")
+    return ok({"offer": serialize_offer(offer, True), "reservation": serialize_reservation(reservation)})
 
 
 @csrf_exempt
@@ -461,14 +628,21 @@ def payments(request):
         return denied
     data = payload(request)
     if request.method == "GET":
-        return ok({"payments": [{"id": p.id, "amount": money(p.amount), "status": p.status, "created_at": p.created_at.isoformat()} for p in Payment.objects.filter(client=profile)]})
+        return ok({"payments": [serialize_payment(p) for p in visible_payments_for(profile).order_by("-created_at")]})
     if profile.role != Profile.ROLE_CLIENT:
         return error("Solo clientes pueden pagar.", 403)
     reservation = get_object_or_404(Reservation, pk=data.get("reservation_id"), client=profile)
+    if reservation.payments.filter(status=Payment.STATUS_PAID).exists():
+        return error("Esta reserva ya esta pagada.", 409)
+    card_number = "".join(ch for ch in str(data.get("card_number", "")) if ch.isdigit())
+    if len(card_number) < 12:
+        return error("Ingresa un numero de tarjeta valido para simular el pago.")
+    if not data.get("card_name") or not data.get("expires") or not data.get("cvv"):
+        return error("Completa los datos de la pasarela de pago.")
     method, _ = PaymentMethod.objects.get_or_create(
         client=profile,
-        label=data.get("method_label", "Pago demo PayU"),
-        defaults={"method_type": data.get("method_type", "tarjeta"), "last_four": data.get("last_four", "0000")},
+        label=data.get("method_label", "Tarjeta demo"),
+        defaults={"method_type": data.get("method_type", "tarjeta"), "last_four": card_number[-4:]},
     )
     payment = Payment.objects.create(
         client=profile,
@@ -492,6 +666,10 @@ def ratings(request):
     reservation = get_object_or_404(Reservation, pk=data.get("reservation_id"))
     if profile not in [reservation.client, reservation.provider]:
         return error("No participas en esta reserva.", 403)
+    if reservation.status != Reservation.STATUS_FINISHED:
+        return error("Solo puedes calificar un servicio finalizado.", 409)
+    if not reservation.payments.filter(status=Payment.STATUS_PAID).exists():
+        return error("Solo puedes calificar despues de registrar el pago.", 409)
     to_profile = reservation.provider if profile == reservation.client else reservation.client
     rating, _ = Rating.objects.update_or_create(
         reservation=reservation,

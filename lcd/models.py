@@ -81,12 +81,14 @@ class PaymentMethod(models.Model):
 class Reservation(models.Model):
     STATUS_PENDING = "pendiente"
     STATUS_ACCEPTED = "aceptado"
+    STATUS_IN_PROGRESS = "prestando"
     STATUS_REJECTED = "rechazado"
     STATUS_FINISHED = "finalizado"
     STATUS_CANCELLED = "cancelado"
     STATUS_CHOICES = [
         (STATUS_PENDING, "Pendiente"),
         (STATUS_ACCEPTED, "Aceptado"),
+        (STATUS_IN_PROGRESS, "Prestando servicio"),
         (STATUS_REJECTED, "Rechazado"),
         (STATUS_FINISHED, "Finalizado"),
         (STATUS_CANCELLED, "Cancelado"),

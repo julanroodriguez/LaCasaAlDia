@@ -14,6 +14,31 @@ const api = async (url, options = {}) => {
 
 const money = (n) => new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(n || 0);
 const prettyDate = (v) => (v ? new Date(v).toLocaleString("es-CO") : "Sin fecha");
+const datetimeLocal = (v) => {
+  if (!v) return "";
+  const d = new Date(v);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+const tabLabel = (value) => ({ inicio: "Inicio", admin: "Admin", agenda: "Agenda", historial: "Historial", reservas: "Reservas", ofertas: "Ofertas", perfil: "Perfil", mensajes: "Mensajes", notificaciones: "Notificaciones" }[value] || value);
+const finishedReservations = (items = []) => items.filter((r) => r.status === "finalizado");
+const agendaReservations = (items = []) => items.filter((r) => ["pendiente", "aceptado", "prestando"].includes(r.status));
+const statusLabel = (status) => ({ pendiente: "Pendiente", aceptado: "Aceptada", prestando: "Prestando servicio", finalizado: "Finalizado", cancelado: "Cancelado", rechazado: "Rechazado" }[status] || status);
+const actionLabel = (status) => ({ aceptado: "Aceptar", prestando: "Iniciar", finalizado: "Finalizar", rechazado: "Rechazar" }[status] || statusLabel(status));
+const providerStatusActions = (r) => {
+  if (r.status === "pendiente") return ["aceptado", "rechazado"];
+  if (r.status === "aceptado") return ["prestando", "rechazado"];
+  if (r.status === "prestando") return ["finalizado"];
+  return [];
+};
+const serviceSteps = (r) => [
+  { key: "aceptado", label: "Aceptada", done: ["aceptado", "prestando", "finalizado"].includes(r.status) },
+  { key: "prestando", label: "Prestando servicio", done: ["prestando", "finalizado"].includes(r.status) },
+  { key: "finalizado", label: "Finalizado", done: r.status === "finalizado" },
+  { key: "pago", label: "Pago", done: r.is_paid },
+  { key: "calificaciones", label: "Calificaciones", done: r.client_rated && r.provider_rated },
+  { key: "terminado", label: "Terminado", done: r.workflow_status === "Terminado" },
+];
 
 function App() {
   const [session, setSession] = useState(null);
@@ -46,8 +71,14 @@ function App() {
 
   const profile = data?.profile || session.profile;
   const tabs = profile.role === "admin"
-    ? ["inicio", "admin", "ofertas", "reservas", "notificaciones"]
-    : ["inicio", "reservas", "ofertas", "perfil", "mensajes", "notificaciones"];
+    ? ["inicio", "admin", "agenda", "ofertas", "reservas", "notificaciones"]
+    : ["inicio", "agenda", "historial", "reservas", "ofertas", "perfil", "mensajes", "notificaciones"];
+  const openTab = (nextTab) => {
+    setTab(nextTab);
+    if (["agenda", "reservas", "historial"].includes(nextTab)) {
+      load().catch((e) => setError(e.message));
+    }
+  };
 
   return (
     <div className="shell">
@@ -57,15 +88,17 @@ function App() {
           <span>{profile.full_name} · {profile.role} · {profile.status}</span>
         </div>
         <nav className="nav">
-          {tabs.map((t) => <button key={t} className={tab === t ? "active" : ""} onClick={() => setTab(t)}>{t}</button>)}
+          {tabs.map((t) => <button key={t} className={tab === t ? "active" : ""} onClick={() => openTab(t)}>{tabLabel(t)}</button>)}
           <button className="secondary" onClick={() => run(() => api("/api/logout/", { method: "POST" }))}>Salir</button>
         </nav>
       </header>
       <main className="main">
         {error && <div className="notice error">{error}</div>}
         {tab === "inicio" && <Home profile={profile} data={data} run={run} setTab={setTab} />}
+        {tab === "agenda" && <Agenda profile={profile} data={data} run={run} refresh={() => load().catch((e) => setError(e.message))} />}
+        {tab === "historial" && <History profile={profile} data={data} run={run} />}
         {tab === "reservas" && <Reservations profile={profile} data={data} run={run} />}
-        {tab === "ofertas" && <Offers profile={profile} data={data} run={run} />}
+        {tab === "ofertas" && <Offers profile={profile} data={data} run={run} setTab={setTab} />}
         {tab === "perfil" && <ProfileEditor profile={profile} data={data} run={run} />}
         {tab === "mensajes" && <Messages run={run} />}
         {tab === "notificaciones" && <Notifications data={data} run={run} />}
@@ -78,11 +111,18 @@ function App() {
 function Auth({ onDone, error, setError }) {
   const [mode, setMode] = useState("login");
   const [form, setForm] = useState({ role: "cliente", email: "", password: "", first_name: "", last_name: "", city: "Bogota" });
+  const [message, setMessage] = useState("");
   const submit = async (e) => {
     e.preventDefault();
     try {
       setError("");
-      await api(mode === "login" ? "/api/login/" : "/api/register/", { method: "POST", body: form });
+      setMessage("");
+      const result = await api(mode === "login" ? "/api/login/" : "/api/register/", { method: "POST", body: form });
+      if (result.pending_approval) {
+        setMessage(result.message || "Tu registro quedo pendiente de aprobacion.");
+        setMode("login");
+        return;
+      }
       await onDone();
     } catch (err) {
       setError(err.message);
@@ -99,6 +139,7 @@ function Auth({ onDone, error, setError }) {
       <form className="auth-panel" onSubmit={submit}>
         <h2>{mode === "login" ? "Iniciar sesion" : "Crear cuenta"}</h2>
         {error && <div className="notice error">{error}</div>}
+        {message && <div className="notice">{message}</div>}
         {mode === "register" && (
           <div className="grid two">
             <Field label="Nombres" value={form.first_name} onChange={(v) => setForm({ ...form, first_name: v })} />
@@ -147,8 +188,73 @@ function Home({ profile, data, run, setTab }) {
       </div>
       <div className="row">
         <button onClick={() => setTab("reservas")}>Gestionar reservas</button>
+        <button className="secondary" onClick={() => setTab("agenda")}>Ver agenda</button>
         <button className="secondary" onClick={() => setTab("ofertas")}>Ver ofertas</button>
         {profile.role === "admin" && <button onClick={() => setTab("admin")}>Panel admin</button>}
+      </div>
+    </section>
+  );
+}
+
+function Agenda({ profile, data, run, refresh }) {
+  const items = agendaReservations(data.reservations).sort((a, b) => new Date(a.scheduled_for) - new Date(b.scheduled_for));
+  return (
+    <section className="section">
+      <div className="section-head">
+        <h2>Agenda</h2>
+        <div className="row">
+          <span className="pill">{items.length} servicios activos</span>
+          <button className="secondary" onClick={refresh}>Actualizar</button>
+        </div>
+      </div>
+      <div className="agenda-board">
+        {items.length === 0 && <div className="notice">No tienes servicios agendados, aceptados o en prestacion.</div>}
+        {items.map((r) => <AgendaBlock key={r.id} r={r} profile={profile} run={run} />)}
+      </div>
+    </section>
+  );
+}
+
+function AgendaBlock({ r, profile, run }) {
+  const counterpart = profile.id === r.client.id ? r.provider : r.client;
+  const canProviderUpdate = r.provider.id === profile.id;
+  const actions = canProviderUpdate ? providerStatusActions(r) : [];
+  return (
+    <article className={`agenda-block status-${r.status}`}>
+      <div className="date-box">
+        <b>{new Date(r.scheduled_for).toLocaleDateString("es-CO", { day: "2-digit", month: "short" })}</b>
+        <span>{new Date(r.scheduled_for).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}</span>
+      </div>
+      <div>
+        <h3>{r.service.name}</h3>
+        <p className="muted">{counterpart.full_name} · {r.modality} · {money(r.total)}</p>
+        <p className="muted">{r.workflow_status}</p>
+        <p>{r.address}</p>
+      </div>
+      <div className="agenda-actions">
+        <span className="pill">{statusLabel(r.status)}</span>
+        {actions.map((s) => (
+          <button
+            key={s}
+            className={s === "rechazado" ? "warning" : "secondary"}
+            onClick={() => run(() => api(`/api/reservations/${r.id}/status/`, { method: "POST", body: { status: s } }))}
+          >
+            {actionLabel(s)}
+          </button>
+        ))}
+      </div>
+    </article>
+  );
+}
+
+function History({ profile, data, run }) {
+  const items = finishedReservations(data.reservations).sort((a, b) => new Date(b.scheduled_for) - new Date(a.scheduled_for));
+  return (
+    <section className="section">
+      <div className="section-head"><h2>Historial</h2><span className="pill">{items.length} servicios realizados</span></div>
+      <div className="cards">
+        {items.length === 0 && <div className="notice">Aun no tienes servicios finalizados.</div>}
+        {items.map((r) => <HistoryCard key={r.id} r={r} profile={profile} run={run} />)}
       </div>
     </section>
   );
@@ -178,30 +284,93 @@ function Reservations({ profile, data, run }) {
 }
 
 function ReservationCard({ r, profile, run }) {
-  const [rating, setRating] = useState({ stars: 5, comment: "" });
   const canProvider = r.provider.id === profile.id;
   const canClient = r.client.id === profile.id;
+  const canPay = canClient && !r.is_paid && r.status !== "cancelado" && r.status !== "rechazado";
+  const [paying, setPaying] = useState(false);
   return (
     <article className="card">
-      <div className="row"><h3>{r.service.name}</h3><span className="pill">{r.status}</span></div>
+      <div className="row"><h3>{r.service.name}</h3><span className="pill">{r.workflow_status || statusLabel(r.status)}</span></div>
       <div className="muted">{prettyDate(r.scheduled_for)} · {r.modality} · {money(r.total)}</div>
       <div>Cliente: {r.client.full_name}</div>
       <div>Prestador: {r.provider.full_name}</div>
       <div>{r.address}</div>
+      <div className="muted">Pago: {r.is_paid ? "Pagado" : "Pendiente"}</div>
+      <ServiceProgress reservation={r} />
       <div className="row">
-        {canProvider && ["aceptado", "rechazado", "finalizado"].map((s) => <button key={s} className={s === "rechazado" ? "warning" : ""} onClick={() => run(() => api(`/api/reservations/${r.id}/status/`, { method: "POST", body: { status: s } }))}>{s}</button>)}
-        {canClient && <button className="secondary" onClick={() => run(() => api("/api/payments/", { method: "POST", body: { reservation_id: r.id, method_label: "Pago demo PayU" } }))}>Pagar</button>}
+        {canProvider && providerStatusActions(r).map((s) => <button key={s} className={s === "rechazado" ? "warning" : ""} onClick={() => run(() => api(`/api/reservations/${r.id}/status/`, { method: "POST", body: { status: s } }))}>{actionLabel(s)}</button>)}
+        {canPay && <button className="secondary" onClick={() => setPaying(!paying)}>{paying ? "Ocultar pago" : "Pagar"}</button>}
       </div>
-      <div className="grid two">
-        <label>Estrellas<select value={rating.stars} onChange={(e) => setRating({ ...rating, stars: e.target.value })}>{[5,4,3,2,1].map((n) => <option key={n}>{n}</option>)}</select></label>
-        <Field label="Comentario" value={rating.comment} onChange={(v) => setRating({ ...rating, comment: v })} />
-      </div>
-      <button className="secondary" onClick={() => run(() => api("/api/ratings/", { method: "POST", body: { ...rating, reservation_id: r.id } }))}>Calificar</button>
+      {paying && <PaymentGateway reservation={r} run={run} />}
     </article>
   );
 }
 
-function Offers({ profile, data, run }) {
+function ServiceProgress({ reservation }) {
+  return (
+    <div className="service-progress">
+      {serviceSteps(reservation).map((step) => <span key={step.key} className={step.done ? "done" : ""}>{step.label}</span>)}
+    </div>
+  );
+}
+
+function PaymentGateway({ reservation, run }) {
+  const [form, setForm] = useState({ card_name: "", card_number: "", expires: "", cvv: "", method_label: "Pasarela demo" });
+  const submit = (e) => {
+    e.preventDefault();
+    run(() => api("/api/payments/", { method: "POST", body: { ...form, reservation_id: reservation.id } }));
+  };
+  return (
+    <form className="payment-gateway grid two" onSubmit={submit}>
+      <div className="gateway-head">
+        <b>Pasarela de pago demo</b>
+        <span className="muted">{money(reservation.total)}</span>
+      </div>
+      <Field label="Nombre en la tarjeta" value={form.card_name} onChange={(v) => setForm({ ...form, card_name: v })} />
+      <Field label="Numero de tarjeta" value={form.card_number} onChange={(v) => setForm({ ...form, card_number: v })} />
+      <Field label="Vencimiento" value={form.expires} onChange={(v) => setForm({ ...form, expires: v })} />
+      <Field label="CVV" value={form.cvv} onChange={(v) => setForm({ ...form, cvv: v })} />
+      <button>Simular pago</button>
+    </form>
+  );
+}
+
+function HistoryCard({ r, profile, run }) {
+  const receivedRatings = r.ratings?.filter((rating) => rating.to_profile_id === profile.id) || [];
+  const givenRating = r.ratings?.find((rating) => rating.from_profile_id === profile.id);
+  const canRate = r.status === "finalizado" && r.is_paid && !givenRating && [r.client.id, r.provider.id].includes(profile.id);
+  return (
+    <article className="card">
+      <div className="row"><h3>{r.service.name}</h3><span className="pill">{r.workflow_status || (r.is_paid ? "Pagado" : "Sin pago")}</span></div>
+      <div className="muted">{prettyDate(r.scheduled_for)} · {money(r.total)}</div>
+      <div>Cliente: {r.client.full_name}</div>
+      <div>Prestador: {r.provider.full_name}</div>
+      <ServiceProgress reservation={r} />
+      <div className="rating-list">
+        <b>Calificaciones</b>
+        {r.ratings?.length ? r.ratings.map((rating) => (
+          <p key={rating.id} className="muted">{rating.from_name} califico a {rating.to_name}: {rating.stars}/5 {rating.comment ? `- ${rating.comment}` : ""}</p>
+        )) : <p className="muted">Sin calificaciones todavia.</p>}
+      </div>
+      {receivedRatings.length > 0 && <div className="notice">Tu calificacion recibida: {receivedRatings.map((rating) => `${rating.stars}/5`).join(", ")}</div>}
+      {canRate && <RatingForm reservationId={r.id} run={run} />}
+      {!r.is_paid && <div className="notice">La calificacion se habilita despues del pago.</div>}
+    </article>
+  );
+}
+
+function RatingForm({ reservationId, run }) {
+  const [rating, setRating] = useState({ stars: 5, comment: "" });
+  return (
+    <div className="grid two">
+      <label>Estrellas<select value={rating.stars} onChange={(e) => setRating({ ...rating, stars: e.target.value })}>{[5,4,3,2,1].map((n) => <option key={n}>{n}</option>)}</select></label>
+      <Field label="Comentario" value={rating.comment} onChange={(v) => setRating({ ...rating, comment: v })} />
+      <button className="secondary" onClick={() => run(() => api("/api/ratings/", { method: "POST", body: { ...rating, reservation_id: reservationId } }))}>Calificar</button>
+    </div>
+  );
+}
+
+function Offers({ profile, data, run, setTab }) {
   const [form, setForm] = useState({ title: "", service_type: "oficios", description: "", address: profile.address || "", budget: "", scheduled_for: "" });
   return (
     <section className="section">
@@ -218,20 +387,72 @@ function Offers({ profile, data, run }) {
         </form>
       )}
       <div className="cards">
-        {data.offers.map((o) => <OfferCard key={o.id} offer={o} profile={profile} run={run} />)}
+        {data.offers.map((o) => <OfferCard key={o.id} offer={o} profile={profile} run={run} setTab={setTab} />)}
       </div>
     </section>
   );
 }
 
-function OfferCard({ offer, profile, run }) {
+function OfferCard({ offer, profile, run, setTab }) {
   const [app, setApp] = useState({ message: "", proposed_price: offer.budget });
+  const [editing, setEditing] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(null);
+  const [editForm, setEditForm] = useState({
+    title: offer.title,
+    service_type: offer.service_type,
+    description: offer.description,
+    address: offer.address,
+    budget: offer.budget,
+    scheduled_for: datetimeLocal(offer.scheduled_for),
+  });
+  const isOwner = profile.role === "cliente" && offer.client?.id === profile.id;
+  const hasApplications = (offer.application_count || offer.applications?.length || 0) > 0;
+  const canEdit = isOwner && offer.status === "abierta" && !hasApplications;
+  const canDelete = isOwner && offer.status === "abierta";
+  const saveEdit = (e) => {
+    e.preventDefault();
+    run(async () => {
+      await api(`/api/offers/${offer.id}/`, { method: "PATCH", body: editForm });
+      setEditing(false);
+    });
+  };
+  const deleteOffer = () => {
+    if (!confirm("Esta oferta se retirara y ya no aparecera publicada. ¿Quieres continuar?")) return;
+    run(() => api(`/api/offers/${offer.id}/`, { method: "DELETE" }));
+  };
+  const acceptApplication = (applicationId) => {
+    run(async () => {
+      await api(`/api/offers/${offer.id}/choose/${applicationId}/`, { method: "POST" });
+      setTab("agenda");
+    });
+  };
   return (
     <article className="card">
       <div className="row"><h3>{offer.title}</h3><span className="pill">{offer.status}</span></div>
       <div className="muted">{offer.service_type} · {money(offer.budget)} · {prettyDate(offer.scheduled_for)}</div>
       <p>{offer.description}</p>
       <div>{offer.address}</div>
+      {(canEdit || canDelete) && !editing && (
+        <div className="row">
+          {canEdit && <button className="secondary" onClick={() => setEditing(true)}>Editar oferta</button>}
+          {canDelete && <button className="warning" onClick={deleteOffer}>Eliminar oferta</button>}
+        </div>
+      )}
+      {isOwner && !canEdit && hasApplications && <div className="notice">Esta oferta ya tiene postulaciones, por eso no se puede editar. Si lo necesitas, puedes eliminarla.</div>}
+      {editing && (
+        <form className="grid two edit-offer" onSubmit={saveEdit}>
+          <Field label="Titulo" value={editForm.title} onChange={(v) => setEditForm({ ...editForm, title: v })} />
+          <label>Tipo<select value={editForm.service_type} onChange={(e) => setEditForm({ ...editForm, service_type: e.target.value })}><option value="oficios">Oficios varios</option><option value="lavanderia">Lavanderia</option></select></label>
+          <Field label="Presupuesto" type="number" value={editForm.budget} onChange={(v) => setEditForm({ ...editForm, budget: v })} />
+          <Field label="Fecha" type="datetime-local" value={editForm.scheduled_for} onChange={(v) => setEditForm({ ...editForm, scheduled_for: v })} />
+          <Field label="Direccion" value={editForm.address} onChange={(v) => setEditForm({ ...editForm, address: v })} />
+          <label>Descripcion<textarea required value={editForm.description} onChange={(e) => setEditForm({ ...editForm, description: e.target.value })} /></label>
+          <div className="row">
+            <button>Guardar cambios</button>
+            <button type="button" className="secondary" onClick={() => setEditing(false)}>Cancelar</button>
+          </div>
+        </form>
+      )}
       {profile.role !== "cliente" && profile.role !== "admin" && (
         <div className="grid">
           <Field label="Precio propuesto" type="number" value={app.proposed_price} onChange={(v) => setApp({ ...app, proposed_price: v })} />
@@ -242,11 +463,40 @@ function OfferCard({ offer, profile, run }) {
       {profile.role === "cliente" && offer.applications?.length > 0 && (
         <div className="card-list">
           <b>Postulaciones</b>
-          {offer.applications.map((a) => <div className="row" key={a.id}><span>{a.provider.full_name} · {money(a.proposed_price)}</span><button className="secondary" onClick={() => run(() => api(`/api/offers/${offer.id}/choose/${a.id}/`, { method: "POST" }))}>Aceptar</button></div>)}
+          {offer.applications.map((a) => (
+            <div className="application-item" key={a.id}>
+              <div className="row">
+                <span>{a.provider.full_name} · {money(a.proposed_price)}</span>
+                <button className="secondary" onClick={() => setProfileOpen(profileOpen === a.id ? null : a.id)}>Ver perfil</button>
+                <button className="secondary" disabled={offer.status !== "abierta"} onClick={() => acceptApplication(a.id)}>{offer.selected_application_id === a.id ? "Aceptado" : "Aceptar"}</button>
+              </div>
+              {profileOpen === a.id && <ProviderProfile profile={a.provider} message={a.message} />}
+            </div>
+          ))}
         </div>
       )}
       {profile.role === "admin" && <button className="warning" onClick={() => run(() => api(`/api/offers/${offer.id}/moderate/`, { method: "POST", body: { status: "eliminada", reason: "Contenido retirado por administracion." } }))}>Eliminar oferta</button>}
     </article>
+  );
+}
+
+function ProviderProfile({ profile, message }) {
+  return (
+    <div className="profile-preview">
+      <div className="row">
+        <b>{profile.full_name}</b>
+        <span className="pill">{profile.average_rating}/5 · {profile.rating_count} calificaciones</span>
+      </div>
+      <div className="grid two">
+        <p><b>Rol:</b> {profile.role}</p>
+        <p><b>Ciudad:</b> {profile.city || "Sin ciudad"}</p>
+        <p><b>Barrio:</b> {profile.neighborhood || "Sin barrio"}</p>
+        <p><b>Telefono:</b> {profile.phone || "Sin telefono"}</p>
+      </div>
+      {profile.bio && <p>{profile.bio}</p>}
+      {profile.store_address && <p><b>Punto fisico:</b> {profile.store_address}</p>}
+      {message && <p className="muted"><b>Mensaje:</b> {message}</p>}
+    </div>
   );
 }
 

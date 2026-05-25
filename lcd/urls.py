@@ -15,6 +15,7 @@ urlpatterns = [
     path("api/reservations/", views.reservations),
     path("api/reservations/<int:reservation_id>/status/", views.reservation_status),
     path("api/offers/", views.offers),
+    path("api/offers/<int:offer_id>/", views.offer_detail),
     path("api/offers/<int:offer_id>/apply/", views.apply_offer),
     path("api/offers/<int:offer_id>/choose/<int:application_id>/", views.choose_application),
     path("api/offers/<int:offer_id>/moderate/", views.moderate_offer),
